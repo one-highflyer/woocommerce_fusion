@@ -47,6 +47,8 @@
   "payment_method_bank_account_mapping",
   "payment_method_gl_account_mapping",
   "customers_sync_section",
+  "use_single_customer",
+  "single_customer",
   "enable_dual_accounts",
   "section_addresses",
   "address_title_convention",
@@ -510,6 +512,20 @@
   },
   {
    "default": "0",
+   "fieldname": "use_single_customer",
+   "fieldtype": "Check",
+   "label": "Use a single Customer for all incoming orders on this server"
+  },
+  {
+   "depends_on": "eval: doc.use_single_customer",
+   "fieldname": "single_customer",
+   "fieldtype": "Link",
+   "label": "Single Customer",
+   "mandatory_depends_on": "eval: doc.use_single_customer",
+   "options": "Customer"
+  },
+  {
+   "default": "0",
    "description": "If two WooCommerce Customer records share the same email address but one is a Company they will be treated as separate entries",
    "fieldname": "enable_dual_accounts",
    "fieldtype": "Check",
@@ -589,7 +605,7 @@
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2025-09-15 05:58:15.105399",
+ "modified": "2025-09-15 18:30:15.105399",
  "modified_by": "Administrator",
  "module": "WooCommerce",
  "name": "WooCommerce Server",
