@@ -700,7 +700,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		
 		return True
 
-	def find_or_create_address(self, canonical_addr: Dict, customer) -> frappe.Document:
+	def find_or_create_address(self, canonical_addr: Dict, customer) -> "frappe.Document":
 		"""
 		Find an existing matching address or create a new one.
 		"""
@@ -738,7 +738,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		# No matching address found, create a new one
 		return self.create_new_address(canonical_addr, customer)
 
-	def create_new_address(self, canonical_addr: Dict, customer) -> frappe.Document:
+	def create_new_address(self, canonical_addr: Dict, customer) -> "frappe.Document":
 		"""
 		Create a new address from canonical address data.
 		"""
@@ -772,7 +772,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		
 		return address
 
-	def find_or_create_contact(self, raw_data: Dict, customer) -> Optional[frappe.Document]:
+	def find_or_create_contact(self, raw_data: Dict, customer) -> Optional["frappe.Document"]:
 		"""
 		Find an existing matching contact or create a new one.
 		Uses email as the primary (and only) matching key for simplicity and reliability.
@@ -806,7 +806,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		# No matching contact found, create a new one
 		return self.create_new_contact(raw_data, customer)
 
-	def create_new_contact(self, raw_data: Dict, customer) -> frappe.Document:
+	def create_new_contact(self, raw_data: Dict, customer) -> "frappe.Document":
 		"""
 		Create a new contact from raw billing data.
 		"""
