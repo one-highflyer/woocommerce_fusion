@@ -487,6 +487,15 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 
 		new_sales_order.woocommerce_status = WC_ORDER_STATUS_MAPPING_REVERSE[wc_order.status]
 		wc_server = frappe.get_cached_doc("WooCommerce Server", wc_order.woocommerce_server)
+		
+		# Set address fields for single-customer mode
+		if wc_server.use_single_customer and wc_server.single_customer:
+			if hasattr(self, 'billing_address') and self.billing_address:
+				new_sales_order.customer_address = self.billing_address.name
+			if hasattr(self, 'shipping_address') and self.shipping_address:
+				new_sales_order.shipping_address_name = self.shipping_address.name
+			if hasattr(self, 'contact') and self.contact:
+				new_sales_order.contact_person = self.contact.name
 
 		new_sales_order.woocommerce_server = wc_order.woocommerce_server
 		# Set the payment_method_title field if necessary, use the payment method ID if the title field is too long
@@ -534,7 +543,20 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 	def create_or_link_customer_and_address(self, wc_order: WooCommerceOrder) -> str:
 		"""
 		Create or update Customer and Address records, with special handling for guest orders using order ID.
+		In single-customer mode, use the configured single customer and perform address/contact reuse.
 		"""
+		wc_server = frappe.get_cached_doc("WooCommerce Server", wc_order.woocommerce_server)
+		
+		# Check if single-customer mode is enabled
+		if wc_server.use_single_customer and wc_server.single_customer:
+			self.customer = frappe.get_doc("Customer", wc_server.single_customer)
+			
+			# Handle address and contact creation/reuse for single customer
+			self.handle_single_customer_address_and_contact_sync(wc_order)
+			
+			return self.customer.name
+		
+		# Existing behavior for non-single-customer mode
 		raw_billing_data = json.loads(wc_order.billing)
 		raw_shipping_data = json.loads(wc_order.shipping)
 		first_name = raw_billing_data.get("first_name", "").strip()
@@ -559,7 +581,6 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			return None
 
 		# Use order ID for guest users, otherwise use email
-		wc_server = frappe.get_cached_doc("WooCommerce Server", wc_order.woocommerce_server)
 		if is_guest:
 			customer_identifier = f"Guest-{order_id}"
 		elif company_name and wc_server.enable_dual_accounts:
@@ -613,6 +634,204 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			frappe.log_error("WooCommerce Error", error_message)
 
 		return customer.name
+
+	def handle_single_customer_address_and_contact_sync(self, wc_order: WooCommerceOrder):
+		"""
+		Handle address and contact creation/reuse for single-customer mode.
+		Implements address matching and contact reuse logic as per the spec.
+		"""
+		raw_billing_data = json.loads(wc_order.billing)
+		raw_shipping_data = json.loads(wc_order.shipping)
+		
+		# Canonicalize address data
+		canonical_billing = self.canonicalize_address_data(raw_billing_data, "Billing")
+		canonical_shipping = self.canonicalize_address_data(raw_shipping_data, "Shipping")
+		
+		# Check if billing and shipping are identical
+		billing_shipping_identical = self.addresses_are_identical(canonical_billing, canonical_shipping)
+		
+		if billing_shipping_identical:
+			# Use one address for both billing and shipping
+			address = self.find_or_create_address(canonical_billing, self.customer)
+			self.billing_address = address
+			self.shipping_address = address
+		else:
+			# Handle billing and shipping addresses separately
+			self.billing_address = self.find_or_create_address(canonical_billing, self.customer)
+			self.shipping_address = self.find_or_create_address(canonical_shipping, self.customer)
+		
+		# Handle contact reuse/creation
+		contact = self.find_or_create_contact(raw_billing_data, self.customer)
+		self.contact = contact
+
+
+	def canonicalize_address_data(self, raw_data: Dict, address_type: str) -> Dict:
+		"""
+		Canonicalize address data for comparison according to the spec.
+		"""
+		default_country = frappe.get_system_settings("country")
+		# Get country name from country code
+		country_code = raw_data.get("country")
+		if country_code:
+			country = frappe.get_value("Country", {"code": country_code.lower()}) or default_country
+		else:
+			country = default_country
+		
+		return {
+			"address_line1": (raw_data.get("address_1") or "Not Provided").strip(),
+			"address_line2": (raw_data.get("address_2") or "Not Provided").strip(),
+			"city": (raw_data.get("city") or "Not Provided").strip(),
+			"state": (raw_data.get("state") or "").strip(),
+			"pincode": (raw_data.get("postcode") or "").strip(),
+			"country": country,
+			"phone": (raw_data.get("phone") or "").strip(),
+			"address_type": address_type
+		}
+
+	def addresses_are_identical(self, addr1: Dict, addr2: Dict) -> bool:
+		"""
+		Compare two canonicalized addresses for equality.
+		"""
+		comparison_fields = ["address_line1", "address_line2", "city", "state", "pincode", "country", "phone"]
+		
+		for field in comparison_fields:
+			if addr1.get(field, "").lower() != addr2.get(field, "").lower():
+				return False
+		
+		return True
+
+	def find_or_create_address(self, canonical_addr: Dict, customer) -> frappe.Document:
+		"""
+		Find an existing matching address or create a new one.
+		"""
+		# Get all addresses linked to this customer, filtered by mandatory fields.
+		addresses = frappe.get_all(
+			"Address",
+			filters=[
+				["disabled", "=", 0],
+				["address_type", "=", canonical_addr["address_type"]],
+				["address_line1", "=", canonical_addr["address_line1"]],
+				["city", "=", canonical_addr["city"]],
+				["country", "=", canonical_addr["country"]],
+				["Dynamic Link", "link_doctype", "=", "Customer"],
+				["Dynamic Link", "link_name", "=", customer.name],
+			],
+			fields=["name", "address_line1", "address_line2", "city", "state", "pincode", "country", "phone"]
+		)
+		
+		# Look for a matching address
+		for addr in addresses:
+			addr_canonical = {
+				"address_line1": (addr.address_line1 or "Not Provided").strip(),
+				"address_line2": (addr.address_line2 or "Not Provided").strip(),
+				"city": (addr.city or "Not Provided").strip(),
+				"state": (addr.state or "").strip(),
+				"pincode": (addr.pincode or "").strip(),
+				"country": addr.country or "Not Provided",
+				"phone": (addr.phone or "").strip(),
+				"address_type": canonical_addr["address_type"]
+			}
+			
+			if self.addresses_are_identical(canonical_addr, addr_canonical):
+				return frappe.get_doc("Address", addr.name)
+		
+		# No matching address found, create a new one
+		return self.create_new_address(canonical_addr, customer)
+
+	def create_new_address(self, canonical_addr: Dict, customer) -> frappe.Document:
+		"""
+		Create a new address from canonical address data.
+		"""
+		title_convention = frappe.db.get_value(
+			"WooCommerce Server", self.woocommerce_order.woocommerce_server, "address_title_convention"
+		)
+		
+		address = frappe.new_doc("Address")
+		address.address_type = canonical_addr["address_type"]
+		address.address_line1 = canonical_addr["address_line1"]
+		address.address_line2 = canonical_addr["address_line2"]
+		address.city = canonical_addr["city"]
+		address.country = canonical_addr["country"]
+		address.state = canonical_addr["state"]
+		address.pincode = canonical_addr["pincode"]
+		address.phone = canonical_addr["phone"]
+		
+		address.address_title = (
+			customer.customer_name
+			if title_convention == "Customer Name only"
+			else f"{customer.name}-{address.address_type}"
+		)
+		
+		# In single-customer mode, don't automatically set primary/shipping flags
+		address.is_primary_address = 0
+		address.is_shipping_address = 0
+		
+		address.append("links", {"link_doctype": "Customer", "link_name": customer.name})
+		address.flags.ignore_mandatory = True
+		address.save()
+		
+		return address
+
+	def find_or_create_contact(self, raw_data: Dict, customer) -> Optional[frappe.Document]:
+		"""
+		Find an existing matching contact or create a new one.
+		Uses email as the primary (and only) matching key for simplicity and reliability.
+		"""
+		email = raw_data.get("email", "").strip().lower()
+		
+		# If we have an email, try to find existing contact by email
+		if email:
+			# Get all contacts linked to this customer having the given email
+			contacts = frappe.get_all(
+				"Contact",
+				fields=["name", "email_id"],
+				filters=[
+					["Dynamic Link", "link_doctype", "=", "Customer"],
+					["Dynamic Link", "link_name", "=", customer.name],
+					["Dynamic Link", "parenttype", "=", "Contact"],
+					["email_id", "=", email],
+				]
+			)
+
+			phone = raw_data.get("phone", "").strip()
+			if len(contacts) > 0:
+				contact = contacts[0]
+				# Found existing contact, optionally backfill phone if missing
+				contact_doc = frappe.get_doc("Contact", contact.name)
+				if phone and not contact_doc.phone and not contact_doc.mobile_no:
+					contact_doc.add_phone(phone, is_primary_mobile_no=1, is_primary_phone=1)
+					contact_doc.save()
+				return contact_doc
+		
+		# No matching contact found, create a new one
+		return self.create_new_contact(raw_data, customer)
+
+	def create_new_contact(self, raw_data: Dict, customer) -> frappe.Document:
+		"""
+		Create a new contact from raw billing data.
+		"""
+		email = raw_data.get("email", "").strip()
+		phone = raw_data.get("phone", "").strip()
+		
+		contact = frappe.new_doc("Contact")
+		contact.first_name = raw_data.get("first_name", "").strip()
+		contact.last_name = raw_data.get("last_name", "").strip()
+		
+		# In single-customer mode, don't set as primary/billing contact automatically
+		contact.is_primary_contact = 0
+		contact.is_billing_contact = 0
+		
+		if phone:
+			contact.add_phone(phone, is_primary_mobile_no=1, is_primary_phone=1)
+		
+		if email:
+			contact.add_email(email, is_primary=1)
+		
+		contact.append("links", {"link_doctype": "Customer", "link_name": customer.name})
+		contact.flags.ignore_mandatory = True
+		contact.save()
+		
+		return contact
 
 	def create_missing_items(self, wc_order, items_list, woocommerce_site):
 		"""
@@ -906,7 +1125,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		address.pincode = raw_data.get("postcode")
 		address.phone = raw_data.get("phone")
 		address.address_title = (
-			{customer.customer_name}
+			customer.customer_name
 			if title_convention == "Customer Name only"
 			else f"{customer.name}-{address.address_type}"
 		)
