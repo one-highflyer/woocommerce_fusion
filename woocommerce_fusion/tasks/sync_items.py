@@ -187,7 +187,8 @@ class SynchroniseItem(SynchroniseWooCommerce):
 			self.get_corresponding_item_or_product()
 			self.sync_wc_product_with_erpnext_item()
 		except SyncDisabledError:
-			raise
+			# Don't raise an error. Let who called this function handle the missing item if needed.
+			pass
 		except Exception as err:
 			try:
 				woocommerce_product_dict = (
