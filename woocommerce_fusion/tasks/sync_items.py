@@ -154,13 +154,40 @@ class SynchroniseItem(SynchroniseWooCommerce):
 		self.woocommerce_product = woocommerce_product
 		self.settings = frappe.get_cached_doc("WooCommerce Integration Settings")
 
+	def validate_sync_enabled(self):
+		"""
+		Validate that sync is enabled at both server and item levels
+		"""
+		if self.item:
+			# Check server-level sync settings
+			wc_server = frappe.get_cached_doc(
+				"WooCommerce Server", self.item.item_woocommerce_server.woocommerce_server
+			)
+			if not wc_server.enable_sync or not wc_server.enable_item_sync:
+				raise SyncDisabledError(wc_server)
+
+			# Check item-level enabled setting
+			if not self.item.item_woocommerce_server.enabled:
+				raise SyncDisabledError(wc_server)
+
+		if self.woocommerce_product:
+			# Check server-level item sync setting for WooCommerce products
+			wc_server = frappe.get_cached_doc(
+				"WooCommerce Server", self.woocommerce_product.woocommerce_server
+			)
+			if not wc_server.enable_sync or not wc_server.enable_item_sync:
+				raise SyncDisabledError(wc_server)
+
 	def run(self):
 		"""
 		Run synchronisation
 		"""
 		try:
+			self.validate_sync_enabled()
 			self.get_corresponding_item_or_product()
 			self.sync_wc_product_with_erpnext_item()
+		except SyncDisabledError:
+			raise
 		except Exception as err:
 			try:
 				woocommerce_product_dict = (
@@ -182,13 +209,6 @@ class SynchroniseItem(SynchroniseWooCommerce):
 		if (
 			self.item and not self.woocommerce_product and self.item.item_woocommerce_server.woocommerce_id
 		):
-			# Validate that this Item's WooCommerce Server has sync enabled
-			wc_server = frappe.get_cached_doc(
-				"WooCommerce Server", self.item.item_woocommerce_server.woocommerce_server
-			)
-			if not wc_server.enable_sync:
-				raise SyncDisabledError(wc_server)
-
 			wc_products = get_list_of_wc_products(item=self.item)
 			if len(wc_products) == 0:
 				raise ValueError(
