@@ -923,7 +923,11 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		# If a Shipping Rule is added, shipping charges will be determined by the Shipping Rule. If not, then
 		# get it from the WooCommerce Order
 		if not new_sales_order.shipping_rule:
-			add_tax_details(new_sales_order, wc_order.shipping_tax, "Shipping Tax", wc_server.f_n_f_account)
+			# Route shipping tax to Tax Account if tax lines sync is enabled, otherwise fallback to F&F
+			shipping_tax_account = (
+				wc_server.tax_account if wc_server.enable_tax_lines_sync else wc_server.f_n_f_account
+			)
+			add_tax_details(new_sales_order, wc_order.shipping_tax, "Shipping Tax", shipping_tax_account)
 			add_tax_details(
 				new_sales_order,
 				wc_order.shipping_total,
