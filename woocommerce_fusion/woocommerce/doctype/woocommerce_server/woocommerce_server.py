@@ -105,18 +105,20 @@ class WooCommerceServer(Document):
 			base_labels = set(WC_ORDER_STATUS_MAPPING.keys())
 			base_slugs = set(WC_ORDER_STATUS_MAPPING.values())
 
-			# Aggregate custom maps from all servers
-			servers = frappe.get_all("WooCommerce Server", fields=["name", "custom_status_map"])
+			# Aggregate custom maps from all servers (ignore permissions) and include current doc
+			servers = frappe.get_all(
+				"WooCommerce Server", fields=["name", "custom_status_map"], ignore_permissions=True
+			)
 			custom_labels = set()
 			custom_slugs = set()
-			for s in servers:
-				entries = s.get("custom_status_map")
+
+			def add_entries(source):
 				data = None
-				if isinstance(entries, list):
-					data = entries
-				elif isinstance(entries, str) and entries.strip():
+				if isinstance(source, list):
+					data = source
+				elif isinstance(source, str) and source.strip():
 					try:
-						data = json.loads(entries)
+						data = json.loads(source)
 					except Exception:
 						data = None
 				if isinstance(data, list):
@@ -128,6 +130,11 @@ class WooCommerceServer(Document):
 								custom_labels.add(label)
 							if slug:
 								custom_slugs.add(slug)
+
+			for s in servers:
+				add_entries(s.get("custom_status_map"))
+			# Also include the current (possibly unsaved) document's entries
+			add_entries(getattr(self, "custom_status_map", None))
 
 			# Final sets
 			all_labels = sorted(base_labels.union(custom_labels))
