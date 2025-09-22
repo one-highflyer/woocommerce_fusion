@@ -678,9 +678,9 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			country = default_country
 		
 		return {
-			"address_line1": (raw_data.get("address_1") or "Not Provided").strip(),
-			"address_line2": (raw_data.get("address_2") or "Not Provided").strip(),
-			"city": (raw_data.get("city") or "Not Provided").strip(),
+			"address_line1": (raw_data.get("address_1") or "-").strip(),
+			"address_line2": (raw_data.get("address_2") or "").strip(),
+			"city": (raw_data.get("city") or "-").strip(),
 			"state": (raw_data.get("state") or "").strip(),
 			"pincode": (raw_data.get("postcode") or "").strip(),
 			"country": country,
@@ -704,30 +704,32 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		"""
 		Find an existing matching address or create a new one.
 		"""
-		# Get all addresses linked to this customer, filtered by mandatory fields.
+		# Get all addresses linked to this customer, filtered by mandatory fields only.
+		filters = [
+			["disabled", "=", 0],
+			["address_type", "=", canonical_addr["address_type"]],
+			["address_line1", "=", canonical_addr["address_line1"]],
+			["city", "=", canonical_addr["city"]],
+			["country", "=", canonical_addr["country"]],
+			["Dynamic Link", "link_doctype", "=", "Customer"],
+			["Dynamic Link", "link_name", "=", customer.name],
+		]
+
 		addresses = frappe.get_all(
 			"Address",
-			filters=[
-				["disabled", "=", 0],
-				["address_type", "=", canonical_addr["address_type"]],
-				["address_line1", "=", canonical_addr["address_line1"]],
-				["city", "=", canonical_addr["city"]],
-				["country", "=", canonical_addr["country"]],
-				["Dynamic Link", "link_doctype", "=", "Customer"],
-				["Dynamic Link", "link_name", "=", customer.name],
-			],
+			filters=filters,
 			fields=["name", "address_line1", "address_line2", "city", "state", "pincode", "country", "phone"]
 		)
 		
 		# Look for a matching address
 		for addr in addresses:
 			addr_canonical = {
-				"address_line1": (addr.address_line1 or "Not Provided").strip(),
-				"address_line2": (addr.address_line2 or "Not Provided").strip(),
-				"city": (addr.city or "Not Provided").strip(),
+				"address_line1": (addr.address_line1 or "-").strip(),
+				"address_line2": (addr.address_line2 or "").strip(),
+				"city": (addr.city or "-").strip(),
 				"state": (addr.state or "").strip(),
 				"pincode": (addr.pincode or "").strip(),
-				"country": addr.country or "Not Provided",
+				"country": addr.country,
 				"phone": (addr.phone or "").strip(),
 				"address_type": canonical_addr["address_type"]
 			}
