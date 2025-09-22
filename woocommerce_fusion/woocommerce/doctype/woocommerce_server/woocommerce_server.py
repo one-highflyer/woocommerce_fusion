@@ -255,13 +255,6 @@ class WooCommerceServer(Document):
 					mapping[label] = slug
 		return mapping
 
-
-@frappe.whitelist()
-def list_effective_woocommerce_status_labels(woocommerce_server: str) -> List[str]:
-	"""Return effective Woo status labels for a given server (for client dropdowns)."""
-	wc_server = frappe.get_cached_doc("WooCommerce Server", woocommerce_server)
-	return list(wc_server.get_effective_status_mapping().keys())
-
 	def get_allowed_inbound_statuses(self) -> List[str]:
 		"""Return allowed inbound Woo status slugs for this server (default: ["processing"])."""
 		allowed = self.get("allowed_inbound_statuses")
@@ -275,6 +268,13 @@ def list_effective_woocommerce_status_labels(woocommerce_server: str) -> List[st
 		except Exception:
 			pass
 		return ["processing"]
+
+
+@frappe.whitelist()
+def list_effective_woocommerce_status_labels(woocommerce_server: str) -> List[str]:
+	"""Return effective Woo status labels for a given server (for client dropdowns)."""
+	wc_server = frappe.get_cached_doc("WooCommerce Server", woocommerce_server)
+	return list(wc_server.get_effective_status_mapping().keys())
 
 
 @frappe.whitelist()
