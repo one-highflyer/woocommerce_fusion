@@ -1,65 +1,122 @@
-# WooCommerce Orders: Status Filtering and Realtime Webhooks
+# WooCommerce Orders: Allowed Statuses, Custom Mappings, and Realtime Webhooks
 
 ## Overview
 
-Synchronize only WooCommerce orders in the "processing" status (skip "failed" and other undesired statuses) and create ERPNext Sales Orders in near‑realtime using a WooCommerce webhook. Keep periodic sync for backfill and deletions.
+Sync WooCommerce orders reliably while supporting site‑specific custom statuses (e.g., `trade-order`).
+We will:
+- Pull orders modified since last sync, plus a pass for deletions (`trash`).
+- Gate processing locally by a per‑server allowlist of Woo statuses (post‑fetch), so custom slugs aren’t missed.
+- Layer custom status mappings on top of the default mapping without modifying the defaults.
+- Feed the Sales Order “WooCommerce Status” dropdown dynamically from the merged mapping.
+- Keep webhook behavior consistent with the scheduler, and enable HMAC verification.
 
-## Goals
+## Current Behavior (reference)
 
-- Restrict scheduled pulls to `processing` status orders (plus `trash` for deletions) to avoid syncing failed orders.
-- Use the built‑in webhook endpoint to create orders in realtime.
-- Optionally enforce the same status filter for the webhook path.
-- Harden webhook security (HMAC verification).
+- Scheduler pulls modified orders and a separate `trash` batch:
+  - Hook: apps/woocommerce_fusion/woocommerce_fusion/hooks.py:149
+  - Task: apps/woocommerce_fusion/woocommerce_fusion/tasks/sync_sales_orders.py:105
+- Status mapping (labels ↔ slugs):
+  - Base map: apps/woocommerce_fusion/woocommerce_fusion/woocommerce/doctype/woocommerce_order/woocommerce_order.py:21
+  - Reverse lookups used at: apps/woocommerce_fusion/woocommerce_fusion/tasks/sync_sales_orders.py:238 and :488
+- Sales Order field options (static Select):
+  - apps/woocommerce_fusion/woocommerce_fusion/fixtures/custom_field.json:858
+- Webhook endpoint for order created:
+  - apps/woocommerce_fusion/woocommerce_fusion/woocommerce_endpoint.py:42 (HMAC block present but commented at :29)
 
-## Current Behavior (for reference)
+## Configuration
 
-- Scheduler enqueues sync of all orders modified since a timestamp, plus `status="trash"`:
-  - Hook: `apps/woocommerce_fusion/woocommerce_fusion/hooks.py:149`
-  - Task: `apps/woocommerce_fusion/woocommerce_fusion/tasks/sync_sales_orders.py:105`
-- `get_list_of_wc_orders` supports filtering by `status="…"` and maps to Woo parameters:
-  - `apps/woocommerce_fusion/woocommerce_fusion/tasks/sync_sales_orders.py:1139`
-  - `apps/woocommerce_fusion/woocommerce_fusion/woocommerce/woocommerce_api.py:556`
-- Realtime webhook endpoint for "Order created":
-  - `apps/woocommerce_fusion/woocommerce_fusion/woocommerce_endpoint.py:42`
-  - HMAC verification is present but commented out: `apps/woocommerce_fusion/woocommerce_fusion/woocommerce_endpoint.py:29`
+- Allowed inbound statuses (per server)
+  - Field: WooCommerce Server.allowed_inbound_statuses (JSON or MultiSelect of Woo slugs).
+  - Example: ["processing", "trade-order"].
+  - Default: ["processing"]. Used to gate scheduler (post‑fetch) and webhook handling.
 
-## Proposed Behavior
+- Custom status mapping overlay (per server)
+  - Field: WooCommerce Server.custom_status_map (JSON list of objects: [{"label": "Trade Order", "slug": "trade-order"}]).
+  - Purpose: extend (not replace) the base WC_ORDER_STATUS_MAPPING with site‑specific label↔slug pairs.
+  - No default; admins add entries as needed for custom slugs.
 
-1) Scheduler: filter by status
-- Replace unfiltered call with a filtered list call:
-  - `get_list_of_wc_orders(date_time_from=..., status="processing")`
-- Keep the `status="trash"` call to process deletions/voiding.
-- File change: `apps/woocommerce_fusion/woocommerce_fusion/tasks/sync_sales_orders.py:105–107`
+## Effective Mapping (runtime)
 
-2) Webhook: realtime creation
-- Continue to accept "Order created" events at:
-  - `/api/method/woocommerce_fusion.woocommerce_endpoint.order_created`
-- Optional: gate by status to match scheduler behavior (create only when `order["status"] == "processing"`).
-  - File: `apps/woocommerce_fusion/woocommerce_fusion/woocommerce_endpoint.py:61`
+- Base mapping remains in code:
+  - apps/woocommerce_fusion/woocommerce_fusion/woocommerce/doctype/woocommerce_order/woocommerce_order.py:21
+- At runtime, compute an effective mapping per server:
+  - effective_map = base_map union server.custom_status_map (server entries win on duplicate keys).
+  - Derive effective_reverse = {slug: label for label, slug in effective_map.items()}.
+- Use the effective_map/effective_reverse everywhere instead of the module constants when a server context is available (inbound and outbound paths).
 
-3) Webhook: security
-- Re‑enable HMAC signature verification so only Woo‑signed payloads are processed.
-  - Uncomment the validation block at: `apps/woocommerce_fusion/woocommerce_fusion/woocommerce_endpoint.py:29–35`
-  - Ensure Woo and ERPNext share the same secret stored on `WooCommerce Server.secret`.
+## Inbound Sync (Woo → ERPNext)
 
-## Optional Configuration (future‑proofing)
+- Scheduler:
+  - Pull modified orders without status filter: get_list_of_wc_orders(date_time_from=...).
+  - Pull deletions: get_list_of_wc_orders(date_time_from=..., status="trash").
+  - For each fetched order, if order.status not in allowed_inbound_statuses: skip (log at INFO/WARN).
+  - Else, map slug → label using effective_reverse. If missing:
+    - Derive a temporary label (title‑cased from slug), log WARN, and continue; or require admins to add a custom map entry (recommended). No crashes.
 
-- If broader flexibility is needed, add a JSON field to `WooCommerce Integration Settings` or `WooCommerce Server` for allowed WC statuses to sync (e.g., `["processing", "completed"]`). For now, keep the scope to `processing`.
+- Webhook:
+  - Accept order created/updated events. Apply the same allowlist gating.
+  - Use effective_reverse to set Sales Order.woocommerce_status.
+
+## Outbound Updates (ERPNext → Woo)
+
+- When pushing status changes back to Woo, use effective_map to resolve the ERPNext label → Woo slug.
+- If the label is not found in effective_map, skip the update and log WARN (don’t raise).
+- Per‑server “Sales Order Status Map” continues to control how ERPNext core statuses map to Woo for outbound transitions:
+  - Doctype: WooCommerce Server > Sales Order Status Map
+  - Its Woo status picker should be populated from effective_map keys.
+
+## Sales Order UI (dynamic dropdown)
+
+- Replace the static Select options with dynamic options derived per server:
+  - Server method: WooCommerceServer.get_woocommerce_order_status_list(self) returns list(effective_map.keys()).
+    - Implementation includes custom_status_map JSON in addition to the base mapping.
+  - Client script (Sales Order form): on load/change of doc.woocommerce_server, fetch and set options via frm.set_df_property("woocommerce_status", "options", options.join("\n")).
+  - List view formatting continues as is; no change required.
+
+## Error Handling and Observability
+
+- KeyError prevention: replace direct dict indexing with .get(...) or effective_reverse.get(...).
+- Unknown slugs:
+  - If not in allowlist: skip and log INFO/WARN with the slug, order id, server.
+  - If in allowlist but not mapped: log WARN, derive a temporary label or ask admins to add a mapping; never crash.
+- Add structured logging around gating decisions for easy diagnosis.
+
+## Security
+
+- Re‑enable HMAC verification in the webhook endpoint:
+  - apps/woocommerce_fusion/woocommerce_fusion/woocommerce_endpoint.py:29–35
+  - Secret sourced from WooCommerce Server.secret
 
 ## Backward Compatibility
 
-- Existing sync logic remains intact aside from filtering. Trash handling remains unchanged. Webhook endpoint URL stays the same.
+- Base mapping and existing behavior stay intact for servers that don’t configure allowlists or custom maps.
+- Default allowlist ["processing"] mimics current expectations while enabling opt‑in for custom slugs.
+- Trash handling remains unchanged.
 
 ## Testing Plan
 
-- Unit/integration tests for:
-  - Scheduler calls `get_list_of_wc_orders(..., status="processing")` and also with `status="trash"`).
-  - Webhook: events with `status != "processing"` are ignored when gating is enabled.
-  - HMAC signature check rejects invalid signatures and accepts valid ones.
+- Effective mapping
+  - Merging logic returns base + custom; reverse map resolves custom slugs.
+- Scheduler gating
+  - Orders with status in allowlist are processed; others skipped.
+  - Deletions still processed via status="trash" fetch.
+- Webhook gating
+  - Events with status in allowlist are created/updated; others ignored.
+- Unknown slugs
+  - No KeyError; logs carry context; temporary label behavior verified (if enabled).
+- Outbound mapping
+  - Only mapped labels are pushed; unmapped labels are skipped with WARN.
+- UI
+  - Sales Order dropdown reflects merged labels for the selected server.
 
 ## Rollout
 
-1) Implement scheduler status filter and (optionally) webhook status gating.
-2) Re‑enable HMAC signature validation and configure Woo webhook with the ERPNext‑provided secret.
-3) Monitor Error Logs during initial rollout.
-
+1) Add fields on WooCommerce Server: allowed_inbound_statuses and custom_status_map.
+2) Update mapping utilities to compute effective_map/effective_reverse per server.
+3) Replace direct mapping usages with effective lookups in inbound and outbound code paths.
+4) Make Sales Order dropdown dynamic (server method + client script).
+5) Re‑enable webhook HMAC verification.
+6) Migrate existing servers to default allowlist ["processing"]. Document how to add e.g., trade-order:
+   - Add to allowed_inbound_statuses: ["processing", "trade-order"].
+   - Add a custom mapping entry: {label: "Trade Order", slug: "trade-order"}.
+   - Verify dropdown now includes "Trade Order" and that inbound/outbound paths work.
