@@ -23,6 +23,26 @@ from woocommerce_fusion.woocommerce.woocommerce_api import (
 )
 
 
+def _get_effective_status_maps(woocommerce_server: str) -> Tuple[Dict, Dict]:
+	"""Use server method to compute effective maps; fallback to base maps if needed."""
+	try:
+		wc_server = frappe.get_cached_doc("WooCommerce Server", woocommerce_server)
+		mapping = wc_server.get_effective_status_mapping()
+		reverse = {v: k for k, v in mapping.items()}
+		return mapping, reverse
+	except Exception:
+		return dict(WC_ORDER_STATUS_MAPPING), dict(WC_ORDER_STATUS_MAPPING_REVERSE)
+
+
+def _get_allowed_inbound_statuses(woocommerce_server: str) -> list[str]:
+	"""Use server method to get allowed inbound statuses with default fallback."""
+	try:
+		wc_server = frappe.get_cached_doc("WooCommerce Server", woocommerce_server)
+		return wc_server.get_allowed_inbound_statuses()
+	except Exception:
+		return ["processing"]
+
+
 def run_sales_order_sync_from_hook(doc, method):
 	if (
 		doc.doctype == "Sales Order"
@@ -199,7 +219,20 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			# create missing order in WooCommerce
 			pass
 		elif self.woocommerce_order and not self.sales_order:
-			# create missing order in ERPNext
+			# create missing order in ERPNext (gate by allowed inbound statuses)
+			allowed = _get_allowed_inbound_statuses(self.woocommerce_order.woocommerce_server)
+			if self.woocommerce_order.status not in allowed:
+				frappe.log_error(
+					"WooCommerce Inbound Status Gating",
+					_(
+						"Skipping creation for Woo order {0} on server '{1}' due to disallowed status '{2}'."
+					).format(
+						self.woocommerce_order.id,
+						self.woocommerce_order.woocommerce_server,
+						self.woocommerce_order.status,
+					),
+				)
+				return
 			self.create_sales_order(self.woocommerce_order)
 		elif self.sales_order and self.woocommerce_order:
 			# both exist, check sync hash
@@ -234,11 +267,21 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		if sales_order.docstatus != 2:
 			so_dirty = False
 
-			# Update the woocommerce_status field if necessary
-			wc_order_status = WC_ORDER_STATUS_MAPPING_REVERSE[woocommerce_order.status]
+			# Update the woocommerce_status field if necessary (use effective reverse map with fallback)
+			_, effective_reverse = _get_effective_status_maps(woocommerce_order.woocommerce_server)
+			wc_order_status = effective_reverse.get(woocommerce_order.status)
+			if wc_order_status is None:
+				# Fallback to a safe label and log a warning
+				wc_order_status = "Processing"
+				frappe.log_error(
+					"WooCommerce Status Mapping",
+					_(
+						"Unknown Woo status slug '{0}' on server '{1}'. Fell back to 'Processing' for Sales Order {2}."
+					).format(woocommerce_order.status, woocommerce_order.woocommerce_server, sales_order.name),
+				)
+			status_changed = False
 			if sales_order.woocommerce_status != wc_order_status:
-				sales_order.woocommerce_status = wc_order_status
-				so_dirty = True
+				status_changed = True
 
 			if sales_order.custom_woocommerce_customer_note != woocommerce_order.customer_note:
 				sales_order.custom_woocommerce_customer_note = woocommerce_order.customer_note
@@ -261,6 +304,22 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			if so_dirty:
 				sales_order.flags.created_by_sync = True
 				sales_order.save()
+
+			# Apply status change after save to bypass Select options validation
+			if status_changed:
+				try:
+					frappe.db.set_value(
+						"Sales Order", sales_order.name, "woocommerce_status", wc_order_status
+					)
+					# Keep in-memory doc consistent
+					sales_order.woocommerce_status = wc_order_status
+				except Exception:
+					frappe.log_error(
+						"WooCommerce Status Mapping",
+						_(
+							"Failed to set woocommerce_status='{0}' on Sales Order {1}."
+						).format(wc_order_status, sales_order.name),
+					)
 
 	def create_and_link_payment_entry(
 		self, wc_order: WooCommerceOrder, sales_order: SalesOrder
@@ -368,14 +427,29 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		wc_order_dirty = False
 
 		# Update the woocommerce_status field if necessary
+		# Resolve ERPNext label → Woo slug using effective mapping; guard if unmapped
+		effective_map, _ = _get_effective_status_maps(wc_order.woocommerce_server)
 		sales_order_wc_status = (
-			WC_ORDER_STATUS_MAPPING[sales_order.woocommerce_status]
+			effective_map.get(sales_order.woocommerce_status)
 			if sales_order.woocommerce_status
 			else None
 		)
 		if sales_order_wc_status != wc_order.status:
-			wc_order.status = sales_order_wc_status
-			wc_order_dirty = True
+			if sales_order_wc_status:
+				wc_order.status = sales_order_wc_status
+				wc_order_dirty = True
+			else:
+				# Unmapped label; skip update and log a warning
+				frappe.log_error(
+					"WooCommerce Status Mapping",
+					_(
+						"Skipping Woo status update for Sales Order {0} on server '{1}' due to unmapped label '{2}'."
+					).format(
+						sales_order.name,
+						wc_order.woocommerce_server,
+						sales_order.woocommerce_status,
+					),
+				)
 
 		# Get the Item WooCommerce ID's
 		for so_item in sales_order.items:
@@ -485,7 +559,9 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		new_sales_order.po_no = new_sales_order.woocommerce_id = wc_order.id
 		new_sales_order.custom_woocommerce_customer_note = wc_order.customer_note
 
-		new_sales_order.woocommerce_status = WC_ORDER_STATUS_MAPPING_REVERSE[wc_order.status]
+		# Compute Woo status using effective reverse map with fallback; set after insert to avoid Select validation
+		_, effective_reverse = _get_effective_status_maps(wc_order.woocommerce_server)
+		resolved_wc_label = effective_reverse.get(wc_order.status, "Processing")
 		wc_server = frappe.get_cached_doc("WooCommerce Server", wc_order.woocommerce_server)
 		
 		# Set address fields for single-customer mode
@@ -533,6 +609,20 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		new_sales_order.flags.ignore_mandatory = True
 		new_sales_order.flags.created_by_sync = True
 		new_sales_order.insert()
+		# Set woocommerce_status after insert to bypass static Select options
+		try:
+			frappe.db.set_value("Sales Order", new_sales_order.name, "woocommerce_status", resolved_wc_label)
+		except Exception:
+			frappe.log_error(
+				"WooCommerce Status Mapping",
+				_(
+					"Failed to set woocommerce_status='{0}' on Sales Order {1}."
+				).format(resolved_wc_label, new_sales_order.name),
+			)
+		new_sales_order.reload()
+		# Reload clears in-memory flags; reapply so hooks can skip sync for programmatic submit
+		new_sales_order.flags.created_by_sync = True
+		new_sales_order.flags.ignore_mandatory = True
 		if wc_server.submit_sales_orders:
 			new_sales_order.submit()
 
@@ -678,9 +768,9 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			country = default_country
 		
 		return {
-			"address_line1": (raw_data.get("address_1") or "Not Provided").strip(),
-			"address_line2": (raw_data.get("address_2") or "Not Provided").strip(),
-			"city": (raw_data.get("city") or "Not Provided").strip(),
+			"address_line1": (raw_data.get("address_1") or "-").strip(),
+			"address_line2": (raw_data.get("address_2") or "").strip(),
+			"city": (raw_data.get("city") or "-").strip(),
 			"state": (raw_data.get("state") or "").strip(),
 			"pincode": (raw_data.get("postcode") or "").strip(),
 			"country": country,
@@ -704,30 +794,32 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		"""
 		Find an existing matching address or create a new one.
 		"""
-		# Get all addresses linked to this customer, filtered by mandatory fields.
+		# Get all addresses linked to this customer, filtered by mandatory fields only.
+		filters = [
+			["disabled", "=", 0],
+			["address_type", "=", canonical_addr["address_type"]],
+			["address_line1", "=", canonical_addr["address_line1"]],
+			["city", "=", canonical_addr["city"]],
+			["country", "=", canonical_addr["country"]],
+			["Dynamic Link", "link_doctype", "=", "Customer"],
+			["Dynamic Link", "link_name", "=", customer.name],
+		]
+
 		addresses = frappe.get_all(
 			"Address",
-			filters=[
-				["disabled", "=", 0],
-				["address_type", "=", canonical_addr["address_type"]],
-				["address_line1", "=", canonical_addr["address_line1"]],
-				["city", "=", canonical_addr["city"]],
-				["country", "=", canonical_addr["country"]],
-				["Dynamic Link", "link_doctype", "=", "Customer"],
-				["Dynamic Link", "link_name", "=", customer.name],
-			],
+			filters=filters,
 			fields=["name", "address_line1", "address_line2", "city", "state", "pincode", "country", "phone"]
 		)
 		
 		# Look for a matching address
 		for addr in addresses:
 			addr_canonical = {
-				"address_line1": (addr.address_line1 or "Not Provided").strip(),
-				"address_line2": (addr.address_line2 or "Not Provided").strip(),
-				"city": (addr.city or "Not Provided").strip(),
+				"address_line1": (addr.address_line1 or "-").strip(),
+				"address_line2": (addr.address_line2 or "").strip(),
+				"city": (addr.city or "-").strip(),
 				"state": (addr.state or "").strip(),
 				"pincode": (addr.pincode or "").strip(),
-				"country": addr.country or "Not Provided",
+				"country": addr.country,
 				"phone": (addr.phone or "").strip(),
 				"address_type": canonical_addr["address_type"]
 			}
@@ -921,7 +1013,13 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		# If a Shipping Rule is added, shipping charges will be determined by the Shipping Rule. If not, then
 		# get it from the WooCommerce Order
 		if not new_sales_order.shipping_rule:
-			add_tax_details(new_sales_order, wc_order.shipping_tax, "Shipping Tax", wc_server.f_n_f_account)
+			# Route shipping tax to Tax Account only when using 'Actual' tax type and an account is configured
+			# Otherwise (template mode or missing account), fall back to Freight & Forwarding account
+			if wc_server.enable_tax_lines_sync and wc_server.use_actual_tax_type and wc_server.tax_account:
+				shipping_tax_account = wc_server.tax_account
+			else:
+				shipping_tax_account = wc_server.f_n_f_account
+			add_tax_details(new_sales_order, wc_order.shipping_tax, "Shipping Tax", shipping_tax_account)
 			add_tax_details(
 				new_sales_order,
 				wc_order.shipping_total,

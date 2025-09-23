@@ -1,7 +1,8 @@
 # Copyright (c) 2023, Dirk van der Laarse and contributors
 # For license information, please see license.txt
 
-from typing import List
+import json
+from typing import Dict, List
 from urllib.parse import urlparse
 
 import frappe
@@ -39,7 +40,12 @@ class WooCommerceServer(Document):
 
 		self.validate_so_status_map()
 		self.validate_item_map()
+
 		self.validate_reserved_stock_setting()
+
+	def on_update(self):
+		"""Refresh Select options only after the document is successfully saved."""
+		self.refresh_status_select_options()
 
 	def validate_so_status_map(self):
 		"""
@@ -89,6 +95,95 @@ class WooCommerceServer(Document):
 						"In order to enable 'Reserved Stock Adjustment', please enable 'Enable Stock Reservation' in 'ERPNext > Stock Settings > Stock Reservation'"
 					)
 				)
+
+	def refresh_status_select_options(self):
+		"""
+		Union base + all servers' custom mappings and update Select options via Property Setters:
+		- Sales Order.woocommerce_status (labels)
+		- WooCommerce Order.status (slugs)
+		"""
+		try:
+			# Base
+			base_labels = set(WC_ORDER_STATUS_MAPPING.keys())
+			base_slugs = set(WC_ORDER_STATUS_MAPPING.values())
+
+			# Aggregate custom maps from all servers (ignore permissions) and include current doc
+			servers = frappe.get_all(
+				"WooCommerce Server", fields=["name", "custom_status_map"], ignore_permissions=True
+			)
+			custom_labels = set()
+			custom_slugs = set()
+
+			def add_entries(source):
+				data = None
+				if isinstance(source, list):
+					data = source
+				elif isinstance(source, str) and source.strip():
+					try:
+						data = json.loads(source)
+					except Exception:
+						data = None
+				if isinstance(data, list):
+					for entry in data:
+						if isinstance(entry, dict):
+							label = entry.get("label")
+							slug = entry.get("slug")
+							if label:
+								custom_labels.add(label)
+							if slug:
+								custom_slugs.add(slug)
+
+			for s in servers:
+				add_entries(s.get("custom_status_map"))
+			# Also include the current (possibly unsaved) document's entries
+			add_entries(getattr(self, "custom_status_map", None))
+
+			# Final sets
+			all_labels = sorted(base_labels.union(custom_labels))
+			all_slugs = sorted(base_slugs.union(custom_slugs))
+
+			# Upsert property setters
+			self._upsert_select_options_property_setter(
+				doc_type="Sales Order",
+				field_name="woocommerce_status",
+				options="\n".join(all_labels),
+			)
+			self._upsert_select_options_property_setter(
+				doc_type="WooCommerce Order",
+				field_name="status",
+				options="\n".join(all_slugs),
+			)
+		except Exception:
+			# Non-fatal: log and continue
+			frappe.log_error(
+				"WooCommerce Status Options",
+				frappe.get_traceback(),
+			)
+
+	def _upsert_select_options_property_setter(self, doc_type: str, field_name: str, options: str) -> None:
+		"""Create or update Property Setter for a Select field's options."""
+		ps_name = frappe.db.get_value(
+			"Property Setter",
+			{"doc_type": doc_type, "field_name": field_name, "property": "options"},
+			"name",
+		)
+		if ps_name:
+			frappe.db.set_value("Property Setter", ps_name, "value", options)
+		else:
+			ps = frappe.get_doc(
+				{
+					"doctype": "Property Setter",
+					"doctype_or_field": "DocField",
+					"doc_type": doc_type,
+					"field_name": field_name,
+					"property": "options",
+					"property_type": "Text",
+					"value": options,
+				}
+			)
+			ps.insert(ignore_permissions=True)
+		# Clear metadata cache for the doctype so changes apply immediately
+		frappe.clear_cache(doctype=doc_type)
 
 	def get_shipment_providers(self):
 		"""
@@ -142,10 +237,69 @@ class WooCommerceServer(Document):
 	@frappe.whitelist()
 	@redis_cache(ttl=86400)
 	def get_woocommerce_order_status_list(self) -> List[str]:
+		"""Retrieve list of WooCommerce Order Status labels (merged base + custom)."""
+		return list(self.get_effective_status_mapping().keys())
+
+	def get_effective_status_mapping(self) -> Dict[str, str]:
+		"""Return effective mapping (label→slug) as base ∪ custom JSON for this server.
+
+		custom_status_map may be stored as parsed list or JSON string; handle both.
+		Entries must be objects with keys: 'label' and 'slug'. Server entries win.
 		"""
-		Retrieve list of WooCommerce Order Statuses
+		mapping: Dict[str, str] = dict(WC_ORDER_STATUS_MAPPING)
+		custom = getattr(self, "custom_status_map", None)
+		data = None
+		if isinstance(custom, list):
+			data = custom
+		elif isinstance(custom, str) and custom.strip():
+			try:
+				data = frappe.parse_json(custom)
+			except Exception:
+				data = None
+		if isinstance(data, list):
+			for entry in data:
+				label = entry.get("label") if isinstance(entry, dict) else None
+				slug = entry.get("slug") if isinstance(entry, dict) else None
+				if label and slug:
+					mapping[label] = slug
+		return mapping
+
+	def get_allowed_inbound_statuses(self) -> List[str]:
+		"""Return allowed inbound Woo status slugs.
+
+		Behavior:
+		- If a non-empty list is configured, return it.
+		- If unset/empty/invalid, return all known slugs from the effective mapping (legacy behavior).
 		"""
-		return [key for key in WC_ORDER_STATUS_MAPPING.keys()]
+		allowed = self.get("allowed_inbound_statuses")
+		parsed: List[str] | None = None
+		if isinstance(allowed, list):
+			parsed = allowed
+		elif isinstance(allowed, str) and allowed.strip():
+			try:
+				data = frappe.parse_json(allowed)
+				if isinstance(data, list):
+					parsed = data
+			except Exception:
+				parsed = None
+
+		# If explicitly configured and non-empty, honor it
+		if parsed and len(parsed) > 0:
+			return parsed
+
+		# Fallback: all known slugs from effective mapping
+		try:
+			return list(self.get_effective_status_mapping().values())
+		except Exception:
+			# absolute fallback: base mapping values
+			return list(WC_ORDER_STATUS_MAPPING.values())
+
+
+@frappe.whitelist()
+def list_effective_woocommerce_status_labels(woocommerce_server: str) -> List[str]:
+	"""Return effective Woo status labels for a given server (for client dropdowns)."""
+	wc_server = frappe.get_cached_doc("WooCommerce Server", woocommerce_server)
+	return list(wc_server.get_effective_status_mapping().keys())
 
 
 @frappe.whitelist()

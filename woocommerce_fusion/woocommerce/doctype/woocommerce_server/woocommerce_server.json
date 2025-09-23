@@ -59,6 +59,9 @@
   "enable_so_status_sync",
   "enable_so_status_sync_warning_html",
   "sales_order_status_map",
+  "status_config_section",
+  "allowed_inbound_statuses",
+  "custom_status_map",
   "order_item_line_fields_section",
   "order_item_fields_warning_html",
   "order_line_item_field_map",
@@ -482,7 +485,26 @@
   {
    "fieldname": "so_status_sync_section",
    "fieldtype": "Section Break",
-   "label": "Sales Order Status Sync"
+  "label": "Sales Order Status Sync"
+  },
+  {
+   "fieldname": "status_config_section",
+   "fieldtype": "Section Break",
+   "label": "Inbound Status Configuration"
+  },
+  {
+   "default": "[]",
+   "description": "JSON array of Woo status slugs allowed for inbound sync (e.g. [\"processing\", \"trade-order\"]). Leave empty to allow all known statuses (legacy behavior).",
+   "fieldname": "allowed_inbound_statuses",
+   "fieldtype": "JSON",
+   "label": "Allowed Inbound Statuses"
+  },
+  {
+   "default": "[]",
+   "description": "JSON list of objects: [{\"label\": \"Trade Order\", \"slug\": \"trade-order\"}].",
+   "fieldname": "custom_status_map",
+   "fieldtype": "JSON",
+   "label": "Custom Status Mapping"
   },
   {
    "default": "0",
@@ -612,7 +634,7 @@
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2025-09-16 12:52:15.105399",
+ "modified": "2025-09-22 23:20:00.000000",
  "modified_by": "Administrator",
  "module": "WooCommerce",
  "name": "WooCommerce Server",
