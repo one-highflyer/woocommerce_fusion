@@ -493,8 +493,8 @@
    "label": "Inbound Status Configuration"
   },
   {
-   "default": "[\"processing\"]",
-   "description": "JSON array of Woo status slugs allowed for inbound sync (e.g. [\"processing\", \"trade-order\"]).",
+   "default": "[]",
+   "description": "JSON array of Woo status slugs allowed for inbound sync (e.g. [\"processing\", \"trade-order\"]). Leave empty to allow all known statuses (legacy behavior).",
    "fieldname": "allowed_inbound_statuses",
    "fieldtype": "JSON",
    "label": "Allowed Inbound Statuses"

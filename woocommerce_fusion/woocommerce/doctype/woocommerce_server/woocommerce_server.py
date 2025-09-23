@@ -265,18 +265,34 @@ class WooCommerceServer(Document):
 		return mapping
 
 	def get_allowed_inbound_statuses(self) -> List[str]:
-		"""Return allowed inbound Woo status slugs for this server (default: ["processing"])."""
+		"""Return allowed inbound Woo status slugs.
+
+		Behavior:
+		- If a non-empty list is configured, return it.
+		- If unset/empty/invalid, return all known slugs from the effective mapping (legacy behavior).
+		"""
 		allowed = self.get("allowed_inbound_statuses")
+		parsed: List[str] | None = None
 		if isinstance(allowed, list):
-			return allowed
-		try:
-			if isinstance(allowed, str) and allowed.strip():
+			parsed = allowed
+		elif isinstance(allowed, str) and allowed.strip():
+			try:
 				data = frappe.parse_json(allowed)
 				if isinstance(data, list):
-					return data
+					parsed = data
+			except Exception:
+				parsed = None
+
+		# If explicitly configured and non-empty, honor it
+		if parsed and len(parsed) > 0:
+			return parsed
+
+		# Fallback: all known slugs from effective mapping
+		try:
+			return list(self.get_effective_status_mapping().values())
 		except Exception:
-			pass
-		return ["processing"]
+			# absolute fallback: base mapping values
+			return list(WC_ORDER_STATUS_MAPPING.values())
 
 
 @frappe.whitelist()
