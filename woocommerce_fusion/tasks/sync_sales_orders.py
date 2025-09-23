@@ -620,6 +620,9 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 				).format(resolved_wc_label, new_sales_order.name),
 			)
 		new_sales_order.reload()
+		# Reload clears in-memory flags; reapply so hooks can skip sync for programmatic submit
+		new_sales_order.flags.created_by_sync = True
+		new_sales_order.flags.ignore_mandatory = True
 		if wc_server.submit_sales_orders:
 			new_sales_order.submit()
 
