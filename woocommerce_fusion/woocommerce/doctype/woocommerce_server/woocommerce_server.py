@@ -40,9 +40,11 @@ class WooCommerceServer(Document):
 
 		self.validate_so_status_map()
 		self.validate_item_map()
+
 		self.validate_reserved_stock_setting()
 
-		# Keep Select options in sync across doctypes using property setters
+	def on_update(self):
+		"""Refresh Select options only after the document is successfully saved."""
 		self.refresh_status_select_options()
 
 	def validate_so_status_map(self):
