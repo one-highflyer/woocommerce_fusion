@@ -564,8 +564,8 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		resolved_wc_label = effective_reverse.get(wc_order.status, "Processing")
 		wc_server = frappe.get_cached_doc("WooCommerce Server", wc_order.woocommerce_server)
 		
-		# Set address fields for single-customer mode
-		if wc_server.use_single_customer and wc_server.single_customer:
+		# Set address/contact fields only when single-customer routing was used
+		if getattr(self, "_used_single_customer", False):
 			if hasattr(self, 'billing_address') and self.billing_address:
 				new_sales_order.customer_address = self.billing_address.name
 			if hasattr(self, 'shipping_address') and self.shipping_address:
@@ -633,20 +633,27 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 	def create_or_link_customer_and_address(self, wc_order: WooCommerceOrder) -> str:
 		"""
 		Create or update Customer and Address records, with special handling for guest orders using order ID.
-		In single-customer mode, use the configured single customer and perform address/contact reuse.
+		Routing can be per-order Customer (by email/guest) or single-customer based on server config + order status.
 		"""
 		wc_server = frappe.get_cached_doc("WooCommerce Server", wc_order.woocommerce_server)
-		
-		# Check if single-customer mode is enabled
-		if wc_server.use_single_customer and wc_server.single_customer:
+
+		# Determine routing model based on server getter and single-customer flags
+		statuses = wc_server.get_statuses_to_route_to_order_customer()
+		route_to_order_customer = wc_order.status in statuses
+
+		use_single_customer_cfg = bool(wc_server.use_single_customer and wc_server.single_customer)
+
+		# Branch selection per spec
+		if use_single_customer_cfg and not route_to_order_customer:
+			# Use single-customer path
+			self._used_single_customer = True
 			self.customer = frappe.get_doc("Customer", wc_server.single_customer)
-			
-			# Handle address and contact creation/reuse for single customer
 			self.handle_single_customer_address_and_contact_sync(wc_order)
-			
 			return self.customer.name
-		
-		# Existing behavior for non-single-customer mode
+
+		# Per-order flow (either explicitly routed or fallback when no single-customer)
+		self._used_single_customer = False
+		# Existing behavior for non-single-customer/per-order mode
 		raw_billing_data = json.loads(wc_order.billing)
 		raw_shipping_data = json.loads(wc_order.shipping)
 		first_name = raw_billing_data.get("first_name", "").strip()
@@ -1188,10 +1195,18 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		address = frappe.new_doc("Address")
 
 		address.address_type = address_type
-		address.address_line1 = raw_data.get("address_1", "Not Provided")
-		address.address_line2 = raw_data.get("address_2", "Not Provided")
-		address.city = raw_data.get("city", "Not Provided")
-		address.country = frappe.get_value("Country", {"code": raw_data.get("country", "IN").lower()})
+		# Avoid using placeholder text for non-mandatory components
+		# Use minimal placeholder '-' only for potentially mandatory fields
+		address.address_line1 = raw_data.get("address_1") or "-"
+		address.address_line2 = raw_data.get("address_2") or ""
+		address.city = raw_data.get("city") or "-"
+		# Resolve country using provided country code or fallback to system default country
+		_default_country = frappe.get_system_settings("country")
+		_country_code = (raw_data.get("country") or "").lower()
+		_country = (
+			frappe.get_value("Country", {"code": _country_code}) if _country_code else None
+		) or _default_country
+		address.country = _country
 		address.state = raw_data.get("state")
 		address.pincode = raw_data.get("postcode")
 		address.phone = raw_data.get("phone")
@@ -1215,10 +1230,17 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		)
 		address = frappe.get_doc("Address", address_name)
 
-		address.address_line1 = raw_data.get("address_1", "Not Provided")
-		address.address_line2 = raw_data.get("address_2", "Not Provided")
-		address.city = raw_data.get("city", "Not Provided")
-		address.country = frappe.get_value("Country", {"code": raw_data.get("country", "IN").lower()})
+		# Avoid using placeholder text for non-mandatory components
+		address.address_line1 = raw_data.get("address_1") or "-"
+		address.address_line2 = raw_data.get("address_2") or ""
+		address.city = raw_data.get("city") or "-"
+		# Resolve country using provided country code or fallback to system default country
+		_default_country = frappe.get_system_settings("country")
+		_country_code = (raw_data.get("country") or "").lower()
+		_country = (
+			frappe.get_value("Country", {"code": _country_code}) if _country_code else None
+		) or _default_country
+		address.country = _country
 		address.state = raw_data.get("state")
 		address.pincode = raw_data.get("postcode")
 		address.phone = raw_data.get("phone")

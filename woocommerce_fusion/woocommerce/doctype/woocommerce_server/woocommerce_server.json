@@ -49,6 +49,7 @@
   "customers_sync_section",
   "use_single_customer",
   "single_customer",
+  "statuses_to_route_to_order_customer",
   "enable_dual_accounts",
   "section_addresses",
   "address_title_convention",
@@ -561,6 +562,13 @@
    "label": "Enable Dual Accounts for Same Email (Private/Company)"
   },
   {
+   "default": "[]",
+   "description": "JSON array of Woo status slugs for which incoming orders should create/match the Customer by email (trade orders). All other orders follow Single Customer if enabled.",
+   "fieldname": "statuses_to_route_to_order_customer",
+   "fieldtype": "JSON",
+   "label": "Statuses to Route to Order Customer"
+  },
+  {
    "default": "0",
    "depends_on": "eval: doc.enable_stock_level_synchronisation",
    "description": "Adjusts stock levels sent to WooCommerce by subtracting reserved stock, ensuring only available stock is synced",
@@ -634,7 +642,7 @@
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2025-09-22 23:20:00.000000",
+ "modified": "2025-09-26 14:20:00.000000",
  "modified_by": "Administrator",
  "module": "WooCommerce",
  "name": "WooCommerce Server",

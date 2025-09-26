@@ -294,6 +294,25 @@ class WooCommerceServer(Document):
 			# absolute fallback: base mapping values
 			return list(WC_ORDER_STATUS_MAPPING.values())
 
+	def get_statuses_to_route_to_order_customer(self) -> List[str]:
+		"""Return list of Woo status slugs that should route to per-order Customer.
+
+		Parses the JSON field `statuses_to_route_to_order_customer`. Returns [] on unset/invalid.
+		"""
+		raw = getattr(self, "statuses_to_route_to_order_customer", None)
+		parsed: List[str] | None = None
+		if isinstance(raw, list):
+			parsed = raw
+		elif isinstance(raw, str) and raw.strip():
+			try:
+				data = frappe.parse_json(raw)
+				if isinstance(data, list):
+					parsed = data
+			except Exception:
+				parsed = None
+
+		return parsed or []
+
 
 @frappe.whitelist()
 def list_effective_woocommerce_status_labels(woocommerce_server: str) -> List[str]:
