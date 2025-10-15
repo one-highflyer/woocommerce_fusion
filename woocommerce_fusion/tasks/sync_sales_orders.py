@@ -979,6 +979,13 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 
 				found_item = frappe.get_doc("Item", item_codes[0].parent) if item_codes else None
 
+			if not found_item:
+				raise ValueError(
+					_("Item not found for WooCommerce product ID {0} on server '{1}'").format(
+						woocomm_item_id, new_sales_order.woocommerce_server
+					)
+				)
+
 			# If we are applying a Sales Taxes and Charges Template (as opposed to Actual Tax), then we need to
 			# determine if the item price should include tax or not
 			if wc_server.enable_tax_lines_sync and not wc_server.use_actual_tax_type:
