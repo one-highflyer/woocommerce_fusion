@@ -721,14 +721,15 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			self.customer = customer
 
 		self.create_or_update_address(wc_order)
-		contact = create_contact(raw_billing_data, self.customer)
-		self.customer.reload()
-		self.customer.customer_primary_contact = contact.name
-		try:
-			self.customer.save()
-		except Exception:
-			error_message = f"{frappe.get_traceback()}\n\nCustomer Data{str(customer.as_dict())}"
-			frappe.log_error("WooCommerce Error", error_message)
+		contact = find_or_create_contact(raw_billing_data, self.customer, is_primary=True, is_billing=True)
+		if contact:
+			self.customer.reload()
+			self.customer.customer_primary_contact = contact.name
+			try:
+				self.customer.save()
+			except Exception:
+				error_message = f"{frappe.get_traceback()}\n\nCustomer Data{str(customer.as_dict())}"
+				frappe.log_error("WooCommerce Error", error_message)
 
 		return customer.name
 
@@ -758,7 +759,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 			self.shipping_address = self.find_or_create_address(canonical_shipping, self.customer)
 		
 		# Handle contact reuse/creation
-		contact = self.find_or_create_contact(raw_billing_data, self.customer)
+		contact = find_or_create_contact(raw_billing_data, self.customer, is_primary=False, is_billing=False)
 		self.contact = contact
 
 
@@ -870,67 +871,6 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		address.save()
 		
 		return address
-
-	def find_or_create_contact(self, raw_data: Dict, customer) -> Optional["frappe.Document"]:
-		"""
-		Find an existing matching contact or create a new one.
-		Uses email as the primary (and only) matching key for simplicity and reliability.
-		"""
-		email = raw_data.get("email", "").strip().lower()
-		
-		# If we have an email, try to find existing contact by email
-		if email:
-			# Get all contacts linked to this customer having the given email
-			contacts = frappe.get_all(
-				"Contact",
-				fields=["name", "email_id"],
-				filters=[
-					["Dynamic Link", "link_doctype", "=", "Customer"],
-					["Dynamic Link", "link_name", "=", customer.name],
-					["Dynamic Link", "parenttype", "=", "Contact"],
-					["email_id", "=", email],
-				]
-			)
-
-			phone = raw_data.get("phone", "").strip()
-			if len(contacts) > 0:
-				contact = contacts[0]
-				# Found existing contact, optionally backfill phone if missing
-				contact_doc = frappe.get_doc("Contact", contact.name)
-				if phone and not contact_doc.phone and not contact_doc.mobile_no:
-					contact_doc.add_phone(phone, is_primary_mobile_no=1, is_primary_phone=1)
-					contact_doc.save()
-				return contact_doc
-		
-		# No matching contact found, create a new one
-		return self.create_new_contact(raw_data, customer)
-
-	def create_new_contact(self, raw_data: Dict, customer) -> "frappe.Document":
-		"""
-		Create a new contact from raw billing data.
-		"""
-		email = raw_data.get("email", "").strip()
-		phone = raw_data.get("phone", "").strip()
-		
-		contact = frappe.new_doc("Contact")
-		contact.first_name = raw_data.get("first_name", "").strip()
-		contact.last_name = raw_data.get("last_name", "").strip()
-		
-		# In single-customer mode, don't set as primary/billing contact automatically
-		contact.is_primary_contact = 0
-		contact.is_billing_contact = 0
-		
-		if phone:
-			contact.add_phone(phone, is_primary_mobile_no=1, is_primary_phone=1)
-		
-		if email:
-			contact.add_email(email, is_primary=1)
-		
-		contact.append("links", {"link_doctype": "Customer", "link_name": customer.name})
-		contact.flags.ignore_mandatory = True
-		contact.save()
-		
-		return contact
 
 	def create_missing_items(self, wc_order, items_list, woocommerce_site):
 		"""
@@ -1319,18 +1259,81 @@ def rename_address(address, customer):
 	frappe.rename_doc("Address", old_address_title, new_address_title)
 
 
-def create_contact(data, customer):
-	email = data.get("email", None)
-	phone = data.get("phone", None)
+def find_or_create_contact(
+	raw_data: Dict, customer, is_primary: bool = False, is_billing: bool = False
+) -> Optional["frappe.Document"]:
+	"""
+	Find an existing matching contact or create a new one.
+	Uses email as the primary (and only) matching key for simplicity and reliability.
+	
+	Args:
+		raw_data: Dictionary containing contact data (email, phone, first_name, last_name)
+		customer: Customer document to link the contact to
+		is_primary: Whether to mark this as primary contact (default False for single-customer mode)
+		is_billing: Whether to mark this as billing contact (default False for single-customer mode)
+	
+	Returns:
+		Contact document (existing or newly created)
+	"""
+	email = raw_data.get("email", "").strip().lower()
+	
+	# If we have an email, try to find existing contact by email
+	if email:
+		# Get all contacts linked to this customer having the given email
+		contacts = frappe.get_all(
+			"Contact",
+			fields=["name", "email_id"],
+			filters=[
+				["Dynamic Link", "link_doctype", "=", "Customer"],
+				["Dynamic Link", "link_name", "=", customer.name],
+				["Dynamic Link", "parenttype", "=", "Contact"],
+				["email_id", "=", email],
+			]
+		)
 
+		phone = raw_data.get("phone", "").strip()
+		if len(contacts) > 0:
+			contact = contacts[0]
+			# Found existing contact, optionally backfill phone if missing
+			contact_doc = frappe.get_doc("Contact", contact.name)
+			if phone and not contact_doc.phone and not contact_doc.mobile_no:
+				contact_doc.add_phone(phone, is_primary_mobile_no=1, is_primary_phone=1)
+				contact_doc.save()
+			return contact_doc
+	
+	# No matching contact found, create a new one
+	return create_new_contact(raw_data, customer, is_primary, is_billing)
+
+
+def create_new_contact(
+	raw_data: Dict, customer, is_primary: bool = False, is_billing: bool = False
+) -> "frappe.Document":
+	"""
+	Create a new contact from raw billing data.
+	
+	Args:
+		raw_data: Dictionary containing contact data (email, phone, first_name, last_name)
+		customer: Customer document to link the contact to
+		is_primary: Whether to mark this as primary contact
+		is_billing: Whether to mark this as billing contact
+	
+	Returns:
+		Newly created Contact document
+	"""
+	email = raw_data.get("email", "").strip()
+	phone = raw_data.get("phone", "").strip()
+	
+	# If no email and no phone, return None
 	if not email and not phone:
-		return
+		return None
 
 	contact = frappe.new_doc("Contact")
-	contact.first_name = data.get("first_name")
-	contact.last_name = data.get("last_name")
-	contact.is_primary_contact = 1
-	contact.is_billing_contact = 1
+	contact.first_name = raw_data.get("first_name", "").strip()
+	contact.last_name = raw_data.get("last_name", "").strip()
+
+	# Set primary/billing flags based on parameters
+	contact.is_primary_contact = 1 if is_primary else 0
+	contact.is_billing_contact = 1 if is_billing else 0
 
 	if phone:
 		contact.add_phone(phone, is_primary_mobile_no=1, is_primary_phone=1)
