@@ -6,11 +6,13 @@ import frappe
 from erpnext.selling.doctype.sales_order.sales_order import SalesOrder
 from erpnext.selling.doctype.sales_order_item.sales_order_item import SalesOrderItem
 from frappe import _
-from frappe.utils import get_datetime
+from frappe.utils import add_to_date, get_datetime
 from frappe.utils.data import cstr, now
 from jsonpath_ng.ext import parse
 
 from woocommerce_fusion.exceptions import SyncDisabledError, WooCommerceOrderNotFoundError
+from woocommerce_fusion.utils import WC_SYNC_SAFETY_BUFFER_HOURS
+from woocommerce_fusion.utils.logger import get_logger
 from woocommerce_fusion.tasks.sync import SynchroniseWooCommerce
 from woocommerce_fusion.tasks.sync_items import run_item_sync
 from woocommerce_fusion.woocommerce.doctype.woocommerce_order.woocommerce_order import (
@@ -22,6 +24,8 @@ from woocommerce_fusion.woocommerce.woocommerce_api import (
 	generate_woocommerce_record_name_from_domain_and_id,
 )
 
+logger = get_logger()
+
 
 def _get_effective_status_maps(woocommerce_server: str) -> Tuple[Dict, Dict]:
 	"""Use server method to compute effective maps; fallback to base maps if needed."""
@@ -31,6 +35,11 @@ def _get_effective_status_maps(woocommerce_server: str) -> Tuple[Dict, Dict]:
 		reverse = {v: k for k, v in mapping.items()}
 		return mapping, reverse
 	except Exception:
+		logger.warning(
+			"Failed to get effective status maps for server '%s', falling back to defaults",
+			woocommerce_server,
+			exc_info=True,
+		)
 		return dict(WC_ORDER_STATUS_MAPPING), dict(WC_ORDER_STATUS_MAPPING_REVERSE)
 
 
@@ -40,6 +49,11 @@ def _get_allowed_inbound_statuses(woocommerce_server: str) -> list[str]:
 		wc_server = frappe.get_cached_doc("WooCommerce Server", woocommerce_server)
 		return wc_server.get_allowed_inbound_statuses()
 	except Exception:
+		logger.warning(
+			"Failed to get allowed inbound statuses for server '%s', falling back to ['processing']",
+			woocommerce_server,
+			exc_info=True,
+		)
 		return ["processing"]
 
 
@@ -104,8 +118,11 @@ def run_sales_order_sync(
 
 def sync_woocommerce_orders_modified_since(date_time_from=None):
 	"""
-	Get list of WooCommerce orders modified since date_time_from
+	Get list of WooCommerce orders modified since date_time_from and sync them.
+	Runs each order sync synchronously so we can track success/failure and
+	conditionally advance wc_last_sync_date.
 	"""
+	sync_start_time = now()
 	wc_settings = frappe.get_doc("WooCommerce Integration Settings")
 
 	if not date_time_from:
@@ -114,24 +131,59 @@ def sync_woocommerce_orders_modified_since(date_time_from=None):
 	# Validate
 	if not date_time_from:
 		error_text = _(
-			"'Last Items Syncronisation Date' field on 'WooCommerce Integration Settings' is missing"
+			"'Last Syncronisation Date' field on 'WooCommerce Integration Settings' is missing"
 		)
 		frappe.log_error(
-			"WooCommerce Items Sync Task Error",
-			error_text,
+			title="WooCommerce Order Sync Task Error",
+			message=error_text,
 		)
 		raise ValueError(error_text)
 
+	logger.info("Starting hourly order sync. wc_last_sync_date=%s", date_time_from)
+
 	wc_orders = get_list_of_wc_orders(date_time_from=date_time_from)
 	wc_orders += get_list_of_wc_orders(date_time_from=date_time_from, status="trash")
+
+	logger.info("Fetched %s WC orders to sync", len(wc_orders))
+
+	had_real_failure = False
+	synced_count = 0
+	skipped_count = 0
+
 	for wc_order in wc_orders:
 		try:
-			run_sales_order_sync(woocommerce_order=wc_order, enqueue=True)
-		# Skip orders with errors, as these exceptions will be logged
+			sync = SynchroniseSalesOrder(woocommerce_order=wc_order)
+			sync.run()
+			if sync.status_gated:
+				skipped_count += 1
+			else:
+				synced_count += 1
 		except Exception:
-			pass
+			had_real_failure = True
+			logger.error(
+				"Failed to sync WC order %s, continuing with next order",
+				getattr(wc_order, "name", "<unknown>"),
+				exc_info=True,
+			)
 
-	frappe.db.set_single_value("WooCommerce Settings", "wc_last_sync_date_items", now())
+	if not had_real_failure:
+		new_sync_date = add_to_date(sync_start_time, hours=-WC_SYNC_SAFETY_BUFFER_HOURS)
+		frappe.db.set_single_value(
+			"WooCommerce Integration Settings", "wc_last_sync_date", new_sync_date
+		)
+		frappe.db.commit()
+		logger.info(
+			"Order sync complete. synced=%s, status_gated=%s. Advanced wc_last_sync_date to %s",
+			synced_count,
+			skipped_count,
+			new_sync_date,
+		)
+	else:
+		logger.info(
+			"Order sync complete with failures. synced=%s, status_gated=%s. wc_last_sync_date NOT advanced",
+			synced_count,
+			skipped_count,
+		)
 
 
 class SynchroniseSalesOrder(SynchroniseWooCommerce):
@@ -148,6 +200,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		self.sales_order = sales_order
 		self.woocommerce_order = woocommerce_order
 		self.settings = frappe.get_cached_doc("WooCommerce Integration Settings")
+		self.status_gated = False
 
 	def run(self):
 		"""
@@ -232,6 +285,13 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 						self.woocommerce_order.status,
 					),
 				)
+				logger.info(
+					"Status gated: Woo order %s on server '%s' has disallowed status '%s'",
+					self.woocommerce_order.id,
+					self.woocommerce_order.woocommerce_server,
+					self.woocommerce_order.status,
+				)
+				self.status_gated = True
 				return
 			self.create_sales_order(self.woocommerce_order)
 		elif self.sales_order and self.woocommerce_order:
