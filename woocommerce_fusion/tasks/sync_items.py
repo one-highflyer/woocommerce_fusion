@@ -7,11 +7,13 @@ import frappe
 from erpnext.stock.doctype.item.item import Item
 from frappe import ValidationError, _, _dict
 from frappe.query_builder import Criterion
-from frappe.utils import get_datetime, now
+from frappe.utils import add_to_date, get_datetime, now
 from jsonpath_ng.ext import parse
 
 from woocommerce_fusion.exceptions import SyncDisabledError
 from woocommerce_fusion.tasks.sync import SynchroniseWooCommerce
+from woocommerce_fusion.utils import WC_SYNC_SAFETY_BUFFER_HOURS
+from woocommerce_fusion.utils.logger import get_logger
 from woocommerce_fusion.woocommerce.doctype.woocommerce_product.woocommerce_product import (
 	WooCommerceProduct,
 )
@@ -97,8 +99,12 @@ def run_item_sync(
 
 def sync_woocommerce_products_modified_since(date_time_from=None):
 	"""
-	Get list of WooCommerce products modified since date_time_from
+	Get list of WooCommerce products modified since date_time_from and sync them.
+	Runs each item sync synchronously so we can track success/failure and
+	conditionally advance wc_last_sync_date_items.
 	"""
+	logger = get_logger()
+	sync_start_time = now()
 	wc_settings = frappe.get_doc("WooCommerce Integration Settings")
 
 	if not date_time_from:
@@ -110,20 +116,55 @@ def sync_woocommerce_products_modified_since(date_time_from=None):
 			"'Last Items Syncronisation Date' field on 'WooCommerce Integration Settings' is missing"
 		)
 		frappe.log_error(
-			"WooCommerce Items Sync Task Error",
-			error_text,
+			title="WooCommerce Items Sync Task Error",
+			message=error_text,
 		)
 		raise ValueError(error_text)
 
+	logger.info("Starting hourly item sync. wc_last_sync_date_items=%s", date_time_from)
+
 	wc_products = get_list_of_wc_products(date_time_from=date_time_from)
+
+	logger.info("Fetched %s WC products to sync", len(wc_products))
+
+	had_real_failure = False
+	synced_count = 0
+	disabled_count = 0
+
 	for wc_product in wc_products:
 		try:
-			run_item_sync(woocommerce_product=wc_product, enqueue=True)
-		# Skip items with errors, as these exceptions will be logged
+			sync = SynchroniseItem(woocommerce_product=wc_product)
+			sync.run()
+			if sync.sync_disabled:
+				disabled_count += 1
+			else:
+				synced_count += 1
 		except Exception:
-			pass
+			had_real_failure = True
+			logger.error(
+				"Failed to sync WC product %s, continuing with next product",
+				getattr(wc_product, "name", "<unknown>"),
+				exc_info=True,
+			)
 
-	frappe.db.set_single_value("WooCommerce Settings", "wc_last_sync_date_items", now())
+	if not had_real_failure:
+		new_sync_date = add_to_date(sync_start_time, hours=-WC_SYNC_SAFETY_BUFFER_HOURS)
+		frappe.db.set_single_value(
+			"WooCommerce Integration Settings", "wc_last_sync_date_items", new_sync_date
+		)
+		frappe.db.commit()
+		logger.info(
+			"Item sync complete. synced=%s, disabled=%s. Advanced wc_last_sync_date_items to %s",
+			synced_count,
+			disabled_count,
+			new_sync_date,
+		)
+	else:
+		logger.info(
+			"Item sync complete with failures. synced=%s, disabled=%s. wc_last_sync_date_items NOT advanced",
+			synced_count,
+			disabled_count,
+		)
 
 
 @dataclass
@@ -153,6 +194,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 		self.item = item
 		self.woocommerce_product = woocommerce_product
 		self.settings = frappe.get_cached_doc("WooCommerce Integration Settings")
+		self.sync_disabled = False
 
 	def validate_sync_enabled(self):
 		"""
@@ -182,13 +224,14 @@ class SynchroniseItem(SynchroniseWooCommerce):
 		"""
 		Run synchronisation
 		"""
+		logger = get_logger()
 		try:
 			self.validate_sync_enabled()
 			self.get_corresponding_item_or_product()
 			self.sync_wc_product_with_erpnext_item()
 		except SyncDisabledError:
-			# Don't raise an error. Let who called this function handle the missing item if needed.
-			pass
+			self.sync_disabled = True
+			logger.info("Sync disabled, skipping product sync")
 		except Exception as err:
 			try:
 				woocommerce_product_dict = (
