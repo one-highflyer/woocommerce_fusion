@@ -24,11 +24,10 @@ from woocommerce_fusion.woocommerce.woocommerce_api import (
 	generate_woocommerce_record_name_from_domain_and_id,
 )
 
-logger = get_logger()
-
 
 def _get_effective_status_maps(woocommerce_server: str) -> Tuple[Dict, Dict]:
 	"""Use server method to compute effective maps; fallback to base maps if needed."""
+	logger = get_logger()
 	try:
 		wc_server = frappe.get_cached_doc("WooCommerce Server", woocommerce_server)
 		mapping = wc_server.get_effective_status_mapping()
@@ -45,6 +44,7 @@ def _get_effective_status_maps(woocommerce_server: str) -> Tuple[Dict, Dict]:
 
 def _get_allowed_inbound_statuses(woocommerce_server: str) -> list[str]:
 	"""Use server method to get allowed inbound statuses with default fallback."""
+	logger = get_logger()
 	try:
 		wc_server = frappe.get_cached_doc("WooCommerce Server", woocommerce_server)
 		return wc_server.get_allowed_inbound_statuses()
@@ -122,6 +122,7 @@ def sync_woocommerce_orders_modified_since(date_time_from=None):
 	Runs each order sync synchronously so we can track success/failure and
 	conditionally advance wc_last_sync_date.
 	"""
+	logger = get_logger()
 	sync_start_time = now()
 	wc_settings = frappe.get_doc("WooCommerce Integration Settings")
 
@@ -268,6 +269,7 @@ class SynchroniseSalesOrder(SynchroniseWooCommerce):
 		"""
 		Syncronise Sales Order between ERPNext and WooCommerce
 		"""
+		logger = get_logger()
 		if self.sales_order and not self.woocommerce_order:
 			# create missing order in WooCommerce
 			pass

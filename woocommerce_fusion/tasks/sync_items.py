@@ -24,8 +24,6 @@ from woocommerce_fusion.woocommerce.woocommerce_api import (
 	generate_woocommerce_record_name_from_domain_and_id,
 )
 
-logger = get_logger()
-
 
 def run_item_sync_from_hook(doc, method):
 	"""
@@ -105,6 +103,7 @@ def sync_woocommerce_products_modified_since(date_time_from=None):
 	Runs each item sync synchronously so we can track success/failure and
 	conditionally advance wc_last_sync_date_items.
 	"""
+	logger = get_logger()
 	sync_start_time = now()
 	wc_settings = frappe.get_doc("WooCommerce Integration Settings")
 
@@ -225,6 +224,7 @@ class SynchroniseItem(SynchroniseWooCommerce):
 		"""
 		Run synchronisation
 		"""
+		logger = get_logger()
 		try:
 			self.validate_sync_enabled()
 			self.get_corresponding_item_or_product()
